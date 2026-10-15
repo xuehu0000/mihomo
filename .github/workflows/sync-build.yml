@@ -1,0 +1,121 @@
+name: Sync upstream release and build with TUN keepalive hack
+
+# Watches MetaCubeX/mihomo for new releases. When a new upstream tag appears,
+# applies patches/tun-keepalive-hack.patch on top of it, builds linux/amd64-v3,
+# pushes the result to the tun-keepalive-hack branch and publishes a release
+# named "<upstream-tag>-tun-ka" with the binary attached.
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # daily
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to build (default: latest release)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork default branch (workflow + patch live here)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine upstream tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r .tag_name)
+          fi
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "::error::could not determine upstream tag"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Upstream tag: $TAG"
+
+      - name: Skip if already built
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REL="${{ steps.tag.outputs.tag }}-tun-ka"
+          if gh release view "$REL" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "Release $REL already exists, nothing to do."
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare source (upstream tag + hack)
+        if: steps.check.outputs.already == 'false'
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          git fetch https://github.com/MetaCubeX/mihomo.git --tags --force
+          git rev-parse "$TAG" >/dev/null 2>&1 || { echo "::error::tag $TAG not found upstream"; exit 1; }
+          cp patches/tun-keepalive-hack.patch /tmp/hack.patch
+          git checkout -B tun-keepalive-hack "$TAG"
+          git apply --check /tmp/hack.patch || {
+            echo "::error::hack patch does not apply cleanly to $TAG - manual intervention needed"
+            exit 1
+          }
+          git apply /tmp/hack.patch
+          echo "Hack applied on top of $TAG"
+
+      - name: Set up Go
+        if: steps.check.outputs.already == 'false'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build linux/amd64-v3
+        if: steps.check.outputs.already == 'false'
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          # match official build: embed CA certificates
+          sudo apt-get update -qq && sudo apt-get install -y -qq ca-certificates
+          cp -f /etc/ssl/certs/ca-certificates.crt component/ca/ca-certificates.crt
+          BUILDTIME=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          GOOS=linux GOARCH=amd64 GOAMD64=v3 CGO_ENABLED=0 \
+            go build -tags "with_gvisor" -trimpath \
+              -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${TAG}-tun-ka' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid=" \
+              -o mihomo .
+          gzip -k mihomo
+          ls -la mihomo.gz
+          ./mihomo -v
+
+      - name: Commit hack and push branch
+        if: steps.check.outputs.already == 'false'
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add listener/sing_tun/dns.go
+          git commit -m "Apply TUN keepalive hack on top of ${TAG}" || echo "nothing to commit"
+          git push origin tun-keepalive-hack --force
+
+      - name: Create release
+        if: steps.check.outputs.already == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          REL="${TAG}-tun-ka"
+          gh release create "$REL" mihomo.gz \
+            --repo "${{ github.repository }}" \
+            --title "mihomo ${TAG} with TUN keepalive hack" \
+            --notes "Built from upstream \`${TAG}\` + TUN keepalive hack.
+
+          The hack makes \`keep-alive-idle\` / \`keep-alive-interval\` / \`disable-keep-alive\` apply to TUN system-stack inbound TCP connections (upstream silently ignores them there and falls back to Go's 15s/15s default).
+
+          - Binary: \`mihomo.gz\` (linux/amd64, x86-64-v3, \`with_gvisor\` tags)
+          - Version string: \`${REL}\`
+          - Source branch: \`tun-keepalive-hack\`"
