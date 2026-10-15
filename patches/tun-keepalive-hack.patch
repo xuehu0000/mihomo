@@ -1,0 +1,27 @@
+diff --git a/listener/sing_tun/dns.go b/listener/sing_tun/dns.go
+index 3ae3981d..6d052949 100644
+--- a/listener/sing_tun/dns.go
++++ b/listener/sing_tun/dns.go
+@@ -7,6 +7,7 @@ import (
+ 	"sync"
+ 	"time"
+ 
++	"github.com/metacubex/mihomo/component/keepalive"
+ 	"github.com/metacubex/mihomo/component/resolver"
+ 	C "github.com/metacubex/mihomo/constant"
+ 	"github.com/metacubex/mihomo/listener/sing"
+@@ -28,6 +29,14 @@ func (h *ListenerHandler) ShouldHijackDns(targetAddr netip.AddrPort) bool {
+ }
+ 
+ func (h *ListenerHandler) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
++	// Dirty hack: sing-tun's system stack accepts TUN inbound TCP with a plain
++	// net.ListenConfig, so keep-alive-idle / keep-alive-interval /
++	// disable-keep-alive never reach those sockets (they silently get Go's
++	// 15s/15s default). Apply the user's keepalive config here, the same way
++	// tproxy/redir inbounds already do. No-op for gvisor/mipstack (their
++	// userspace conns don't implement the interface), so effectively this only
++	// affects the system stack.
++	keepalive.TCPKeepAlive(conn)
+ 	if h.ShouldHijackDns(metadata.Destination.AddrPort()) {
+ 		log.Debugln("[DNS] hijack tcp:%s", metadata.Destination.String())
+ 		return resolver.RelayDnsConn(ctx, conn, resolver.DefaultDnsReadTimeout)
