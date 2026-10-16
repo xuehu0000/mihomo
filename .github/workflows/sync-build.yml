@@ -112,9 +112,28 @@ jobs:
           gh release create "$REL" mihomo.gz \
             --repo "${{ github.repository }}" \
             --title "mihomo ${TAG} with TUN keepalive hack" \
-            --notes "Built from upstream \`${TAG}\` + TUN keepalive hack.
+            --notes "Built from upstream \`${TAG}\` + TUN keepalive hack (v2).
 
-          The hack makes \`keep-alive-idle\` / \`keep-alive-interval\` / \`disable-keep-alive\` apply to TUN system-stack inbound TCP connections (upstream silently ignores them there and falls back to Go's 15s/15s default).
+          ## Problem
+
+          In TUN system-stack mode, mihomo terminates every client TCP connection locally. Upstream ignores the keepalive config on this inbound path, so Go's hardcoded default applies: a probe every 15s on **every** idle connection.
+
+          When mihomo runs as a transparent gateway (router/box), those probes go to LAN clients. Phones must wake their radio to ACK each one, which keeps them from deep sleep and causes heavy background battery drain, even though no proxy runs on the phone itself.
+
+          ## Change
+
+          TUN inbound TCP connections get their own fixed keepalive (Idle=7200s, Interval=75s, Count=9, i.e. the classic RFC 1122 / Linux defaults). It is independent of the global keepalive settings. **Outbound connections are untouched.**
+
+          ## Why these values
+
+          The two sides of the proxy need keepalive for different reasons:
+
+          - **Inbound (client <-> mihomo, LAN):** no NAT or middlebox in between, so nothing can silently drop an idle connection. Keepalive is only needed to reap dead peers (client left Wi-Fi, powered off). mihomo never closes idle TCP connections by itself, so disabling keepalive entirely would let dead connections pile up on a 24/7 box. 7200s does that cleanup (dead peers reaped ~2.2h after last activity) at one probe per 2h per idle connection, which is negligible for battery.
+          - **Outbound (mihomo <-> remote/proxy node, WAN):** this is the path that crosses NAT and ISP middleboxes that may blackhole idle flows. It still uses the regular keepalive config, so the risky public segment stays protected.
+
+          Apps that need low-latency long-lived connections (push, IM) already run their own application-level heartbeats end to end, so they don't rely on TCP keepalive.
+
+          ## Build
 
           - Binary: \`mihomo.gz\` (linux/amd64, x86-64-v3, \`with_gvisor\` tags)
           - Version string: \`${REL}\`
