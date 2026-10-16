@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/component/keepalive"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/listener/sing"
@@ -28,6 +29,22 @@ func (h *ListenerHandler) ShouldHijackDns(targetAddr netip.AddrPort) bool {
 }
 
 func (h *ListenerHandler) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
+	// Dirty hack v2: TUN 入站写死 2h keepalive 当僵尸收割机,不吃全局配置。
+	// 原理: sing-tun 的 system 栈用普通 net.ListenConfig 接受 TUN 入站 TCP,
+	// 全局 keepalive 配置到不了这些 socket(默认是 Go 的 15s/15s)。
+	// 这里直接写死 Idle=7200s / Interval=75s / Count=9:2h 无流量才开始探测,
+	// 9 次无应答(约 2.2h)判定死亡,由内核回收——7x24 无人值守不堆僵尸。
+	// 类型断言失败(gvisor/mipstack 用户态连接)则静默跳过,所以实际只影响
+	// system 栈(含 mixed 的 TCP 一半)。
+	if tcp, ok := conn.(keepalive.TCPConn); ok && tcp != nil {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAliveConfig(net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     7200 * time.Second,
+			Interval: 75 * time.Second,
+			Count:    9,
+		})
+	}
 	if h.ShouldHijackDns(metadata.Destination.AddrPort()) {
 		log.Debugln("[DNS] hijack tcp:%s", metadata.Destination.String())
 		return resolver.RelayDnsConn(ctx, conn, resolver.DefaultDnsReadTimeout)
